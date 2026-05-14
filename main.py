@@ -1,76 +1,173 @@
-from embeddings import make_tfidf_embedder
-from manifolds import make_pca_projector
-from distances import cosine_distance, make_mahalanobis_distance
-from traversals import semantic_decay_traversal
-from visualizations import plot_manifolds
+"""
+mRAG experiment harness — CLI dispatcher.
+
+Subcommands:
+  smoke         End-to-end sanity run on 5 questions with TF-IDF, no API calls.
+  run           Run the experiment grid (cells are skipped when results
+                already exist in the parquet — caches do the rest).
+  analyze       Build the HTML report from results.parquet.
+  cache-stats   Inspect the on-disk cache.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import List
+
+from analyze import build_report
+from benchmarks import load_benchmark
+from cache import cache_stats
+from distances import METRICS
+from embeddings import build_embedder
+from experiment import CellConfig, run_cell, run_grid, write_records
 
 
-def build_prompt(query: str, corpus: list, hops: dict) -> str:
-    primary = [corpus[i] for i in hops.get(0, frozenset())]
-    structural = [corpus[i] for t, docs in hops.items() if t > 0 for i in docs]
-
-    return f"""<primary_semantic_context>
-{chr(10).join(f"- {doc}" for doc in primary)}
-</primary_semantic_context>
-
-<structurally_linked_context>
-{chr(10).join(f"- {doc}" for doc in structural)}
-</structurally_linked_context>
-
-System: Synthesize the primary context to answer the user's query: "{query}".
-Use the structurally linked context to draw broader multi-hop connections if the primary context is missing direct evidence."""
+DEFAULT_DATASETS = ["hotpotqa", "multihoprag", "2wiki"]
+# gemini-embedding-001 is the production text model with batch support.
+# gemini-embedding-2 (multimodal) silently accepts only 1 item per call; if you
+# pass it via --embedders, the harness detects the short response and falls
+# back to one-at-a-time, but that is slower and costlier.
+DEFAULT_EMBEDDERS = ["tfidf", "all-MiniLM-L6-v2", "bge-small-en-v1.5", "gemini-embedding-001"]
+DEFAULT_METRICS = METRICS
+DEFAULT_STRATEGIES = ["decay", "ppr"]
 
 
-def main():
-    # 1. Corpus designed to explicitly test multi-hop bottlenecks
-    corpus = [
-        "The latest iPhone battery uses lithium and advanced chemistry.",  # D0
-        "Lithium is a key component of the global battery supply chain.",  # D1
-        "Cobalt mining is essential for the battery supply chain.",  # D2
-        "Electric vehicles rely on extensive battery supply chains.",  # D3
-        "Apples and bananas are yellow fruits.",  # D4 (Noise)
-        "The weather in London is rainy today.",  # D5 (Noise)
-    ]
-    query = "iPhone battery materials"
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
 
-    # 2. Dependency Injection: Embeddings & Projections
-    embedder = make_tfidf_embedder(corpus + [query])
-    X = embedder(corpus)
-    q = embedder([query])[0]
+def cmd_smoke(args: argparse.Namespace) -> int:
+    """End-to-end on 5 HotpotQA distractor items with TF-IDF, no Gemini.
 
-    # Project to d=2 bottleneck
-    projector = make_pca_projector(d=2)
-    Z, inv_cov = projector(X)
+    Sanity-checks every retrieval mode and every Z-distance metric.
+    """
+    print("[smoke] loading 5 HotpotQA distractor items...")
+    questions = load_benchmark("hotpotqa", n=5, seed=42)
 
-    # 3. Distance Metrics passed as pure closures
-    dist_X = cosine_distance
-    dist_Z = make_mahalanobis_distance(inv_cov)
+    print("[smoke] building TF-IDF embedder...")
+    fit_corpus = [c for q in questions for c in q.corpus]
+    embedder = build_embedder("tfidf", fit_corpus=fit_corpus, target_dim=128)
 
-    # 4. Traversal
-    hops = semantic_decay_traversal(
-        q=q,
-        X=X,
-        Z=Z,
-        dist_X_fn=dist_X,
-        dist_Z_fn=dist_Z,
-        tau=0.75,  # Semantic similarity threshold limits starting point to D0 only
-        epsilon=1.8,  # Structural Mahalanobis jump limit
-        gamma=1.5,  # Decay factor (drift multiplier > 1 allows thematic walking)
-        max_hops=3,
+    out_path = Path("results/smoke.parquet")
+    if out_path.exists():
+        out_path.unlink()
+
+    cells = []
+    # naive RAG + no_context once.
+    cells.append(CellConfig(dataset="hotpotqa", embedder="tfidf", metric="cosine_x",
+                             strategy="naive", d=16, n=5, gen_model="none"))
+    cells.append(CellConfig(dataset="hotpotqa", embedder="none", metric="none",
+                             strategy="no_context", d=16, n=5, gen_model="none"))
+    # mRAG ablation
+    for metric in METRICS:
+        for strategy in ["decay", "ppr"]:
+            cells.append(CellConfig(dataset="hotpotqa", embedder="tfidf", metric=metric,
+                                     strategy=strategy, d=16, n=5, gen_model="none"))
+
+    # Monkey-patch generate_answer + llm_judge to avoid API calls in smoke.
+    import llm
+    def _fake_gen(prompt: str, model: str = "none") -> str:
+        # Pretend we read the first chunk of the prompt and reuse it.
+        for line in prompt.splitlines():
+            if line.startswith("- "):
+                return line[2:].split(".")[0][:50]
+        return "unknown"
+    def _fake_judge(*args, **kwargs):
+        return {"correct": False, "rationale": "smoke mode"}
+    llm.generate_answer = _fake_gen
+    llm.llm_judge = _fake_judge
+    import experiment
+    experiment.generate_answer = _fake_gen
+    experiment.llm_judge = _fake_judge
+
+    import time as _t
+    t0 = _t.time()
+    for i, cfg in enumerate(cells, start=1):
+        records = run_cell(cfg, questions, embedder, do_judge=False,
+                            cell_index=i, total_cells=len(cells))
+        write_records(records, out_path)
+    print(f"[smoke] wrote {out_path} in {_t.time() - t0:.1f}s")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    datasets = args.datasets or DEFAULT_DATASETS
+    embedders = args.embedders or DEFAULT_EMBEDDERS
+    metrics = args.metrics or DEFAULT_METRICS
+    strategies = args.strategies or DEFAULT_STRATEGIES
+
+    print(f"[run] datasets={datasets} embedders={embedders} metrics={metrics} strategies={strategies}")
+    print(f"[run] n={args.n} d={args.d} judge={args.judge}")
+
+    out = run_grid(
+        datasets=datasets,
+        embedders=embedders,
+        metrics=metrics,
+        strategies=strategies,
+        n=args.n,
+        d=args.d,
+        out_path=args.out,
+        judge=args.judge,
     )
+    print(f"[run] results -> {out}")
+    return 0
 
-    print("=== Multi-hop Traversal Result ===")
-    for t in sorted(hops.keys()):
-        print(f"Hop {t}:")
-        for d in hops[t]:
-            print(f"  [D{d}] {corpus[d]}")
 
-    print("\n=== Section 6 LLM Synthesis Prompt ===")
-    print(build_prompt(query, corpus, hops))
+def cmd_analyze(args: argparse.Namespace) -> int:
+    out = build_report(results_path=args.results, out_path=args.report)
+    print(f"[analyze] report -> {out.resolve()}")
+    return 0
 
-    # 5. Visualization Map
-    plot_manifolds(X, Z, hops, corpus)
+
+def cmd_cache_stats(args: argparse.Namespace) -> int:
+    stats = cache_stats()
+    print(json.dumps(stats, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argparser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="mrag")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("smoke", help="end-to-end sanity run (no API)")
+    s.set_defaults(func=cmd_smoke)
+
+    r = sub.add_parser("run", help="run experiment grid")
+    r.add_argument("--datasets", nargs="*", default=None)
+    r.add_argument("--embedders", nargs="*", default=None)
+    r.add_argument("--metrics", nargs="*", default=None)
+    r.add_argument("--strategies", nargs="*", default=None)
+    r.add_argument("--n", type=int, default=500)
+    r.add_argument("--d", type=int, default=32)
+    r.add_argument("--out", type=str, default="results/results.parquet")
+    r.add_argument("--no-judge", dest="judge", action="store_false")
+    r.add_argument("--judge", dest="judge", action="store_true")
+    r.set_defaults(judge=True)
+    r.set_defaults(func=cmd_run)
+
+    a = sub.add_parser("analyze", help="build HTML report")
+    a.add_argument("--results", type=str, default="results/results.parquet")
+    a.add_argument("--report", type=str, default="results/report.html")
+    a.set_defaults(func=cmd_analyze)
+
+    cs = sub.add_parser("cache-stats", help="show cache contents")
+    cs.set_defaults(func=cmd_cache_stats)
+
+    return p
+
+
+def main(argv: List[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

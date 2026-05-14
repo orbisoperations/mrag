@@ -12,11 +12,18 @@ def semantic_decay_traversal(
     epsilon: float,
     gamma: float,
     max_hops: int,
+    initial_set: FrozenSet[int] | None = None,
 ) -> Dict[int, FrozenSet[int]]:
-    """Strategy 1: Bounded Beam Search with Semantic Decay (Pure Functional/Recursive)"""
+    """Strategy 1: Bounded Beam Search with Semantic Decay.
 
-    # Hop 0: Strict Semantic Matches
-    s_0 = frozenset(i for i, x in enumerate(X) if dist_X_fn(q, x) <= tau)
+    If `initial_set` is provided, use it directly as S^(0) (top-K cosine anchors
+    from the caller). Otherwise, fall back to the paper's strict cosine cutoff.
+    """
+
+    if initial_set is not None:
+        s_0 = initial_set
+    else:
+        s_0 = frozenset(i for i, x in enumerate(X) if dist_X_fn(q, x) <= tau)
 
     # Pure recursive traversal function (no mutable state lists)
     def traverse(
